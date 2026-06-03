@@ -165,6 +165,52 @@ static BlockMeta *find_segregated_fit(BlockMeta **last, size_t size) {
   return result;
 }
 
+static void split_block(BlockMeta *block, size_t size) {
+  if (block->size >= size + META_SIZE + 8) {
+    BlockMeta *new_block = (BlockMeta *)((char *)block + META_SIZE + size);
+
+    new_block->size = block->size - size - META_SIZE;
+    new_block->is_free = true;
+    new_block->next_free = NULL;
+    new_block->prev_free = NULL;
+
+    new_block->next = block->next;
+    new_block->prev = block;
+
+    if (new_block->next) {
+      new_block->next->prev = new_block;
+    }
+    block->next = new_block;
+
+    block->size = size;
+  }
+}
+
+static BlockMeta *coalesce_blocks(BlockMeta *block) {
+  if (block->next && block->next->is_free) {
+    if ((char *)block + META_SIZE + block->size == (char *)block->next) {
+      block->size += META_SIZE + block->next->size;
+      block->next = block->next->next;
+      if (block->next) {
+        block->next->prev = block;
+      }
+    }
+  }
+
+  if (block->prev && block->prev->is_free) {
+    if ((char *)block->prev + META_SIZE + block->prev->size == (char *)block) {
+      block->prev->size += META_SIZE + block->size;
+      block->prev->next = block->next;
+      if (block->next) {
+        block->next->prev = block->prev;
+      }
+      block = block->prev;
+    }
+  }
+
+  return block;
+}
+
 void *my_malloc(size_t size) {
   if (size == 0) return NULL;
   size = (size + 7) & ~7;
@@ -199,6 +245,9 @@ void *my_malloc(size_t size) {
     if (!block) return NULL;
     if (!global_base) global_base = block;
   } else {
+    if (current_strategy != STRATEGY_SEGREGATED) {
+      split_block(block, size);
+    }
     block->is_free = false;
   }
 
@@ -216,7 +265,7 @@ void my_free(void *ptr) {
   if (current_strategy == STRATEGY_SEGREGATED) {
       add_to_segregated_list(block);
   } else {
-      // TODO: Coalescing (merging) of adjacent free blocks for generic strategies
+      coalesce_blocks(block);
   }
 }
 
