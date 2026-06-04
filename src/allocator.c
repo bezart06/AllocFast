@@ -1,11 +1,22 @@
 #include "allocator.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
+#define ENABLE_RED_ZONES 1
+
+#if ENABLE_RED_ZONES
+#define REDZONE_SIZE 8
+#define REDZONE_MAGIC 0xAA
+#endif
+
 typedef struct BlockMeta {
   size_t size;
+#if ENABLE_RED_ZONES
+  size_t exact_size;
+#endif
   bool is_free;
   struct BlockMeta *next;
   struct BlockMeta *prev;
@@ -213,26 +224,34 @@ static BlockMeta *coalesce_blocks(BlockMeta *block) {
 
 void *my_malloc(size_t size) {
   if (size == 0) return NULL;
-  size = (size + 7) & ~7;
+
+  size_t exact_req_size = size;
+  size_t alloc_size = size;
+
+#if ENABLE_RED_ZONES
+  alloc_size += 2 * REDZONE_SIZE;
+#endif
+
+  alloc_size = (alloc_size + 7) & ~7;
 
   BlockMeta *block = NULL;
   BlockMeta *last = NULL;
 
   if (current_strategy == STRATEGY_SEGREGATED) {
-    block = find_segregated_fit(&last, size);
+    block = find_segregated_fit(&last, alloc_size);
   } else {
     if (!global_base) {
-      block = request_memory(NULL, size);
+      block = request_memory(NULL, alloc_size);
       if (!block) return NULL;
       global_base = block;
-      return (block + 1);
+      goto format_block;
     }
 
     last = global_base;
     if (current_strategy == STRATEGY_FIRST_FIT) {
-      block = find_first_fit(&last, size);
+      block = find_first_fit(&last, alloc_size);
     } else if (current_strategy == STRATEGY_BEST_FIT) {
-      block = find_best_fit(&last, size);
+      block = find_best_fit(&last, alloc_size);
     }
   }
 
@@ -241,25 +260,70 @@ void *my_malloc(size_t size) {
       last = global_base;
       while (last->next) last = last->next;
     }
-    block = request_memory(last, size);
+    block = request_memory(last, alloc_size);
     if (!block) return NULL;
     if (!global_base) global_base = block;
   } else {
     if (current_strategy != STRATEGY_SEGREGATED) {
-      split_block(block, size);
+      split_block(block, alloc_size);
     }
     block->is_free = false;
   }
 
+format_block:
+#if ENABLE_RED_ZONES
+  block->exact_size = exact_req_size;
+  char *front_rz = (char *)(block + 1);
+  char *payload = front_rz + REDZONE_SIZE;
+  char *back_rz = payload + exact_req_size;
+
+  memset(front_rz, REDZONE_MAGIC, REDZONE_SIZE);
+  memset(back_rz, REDZONE_MAGIC, REDZONE_SIZE);
+
+  return payload;
+#else
   return (block + 1);
+#endif
 }
 
-static BlockMeta *get_block_ptr(void *ptr) { return (BlockMeta *)ptr - 1; }
+static BlockMeta *get_block_ptr(void *ptr) {
+#if ENABLE_RED_ZONES
+  return (BlockMeta *)((char *)ptr - REDZONE_SIZE) - 1;
+#else
+  return (BlockMeta *)ptr - 1;
+#endif
+}
 
 void my_free(void *ptr) {
   if (!ptr) return;
 
   BlockMeta *block = get_block_ptr(ptr);
+
+#if ENABLE_RED_ZONES
+  char *payload = (char *)ptr;
+  char *front_rz = (char *)(block + 1);
+  char *back_rz = payload + block->exact_size;
+
+  bool corrupted = false;
+  for (int i = 0; i < REDZONE_SIZE; i++) {
+    if ((unsigned char)front_rz[i] != REDZONE_MAGIC) {
+      fprintf(stderr, "\n[FATAL ERROR] Underflow detected (Front redzone corrupted) at block %p!\n", ptr);
+      corrupted = true;
+      break;
+    }
+    if ((unsigned char)back_rz[i] != REDZONE_MAGIC) {
+      fprintf(stderr, "\n[FATAL ERROR] Overflow detected (Back redzone corrupted) at block %p!\n", ptr);
+      corrupted = true;
+      break;
+    }
+  }
+
+  if (corrupted) {
+    fprintf(stderr, "Aborting execution.\n");
+    abort();
+  }
+#endif
+
   block->is_free = true;
 
   if (current_strategy == STRATEGY_SEGREGATED) {
@@ -272,24 +336,27 @@ void my_free(void *ptr) {
 void set_alloc_strategy(AllocStrategy strategy) { current_strategy = strategy; }
 
 int main(void) {
-  printf("Testing Segregated Free Lists (SLUB-like)...\n");
-  set_alloc_strategy(STRATEGY_SEGREGATED);
+  printf("Testing Normal Allocation...\n");
+  int *arr = (int *)my_malloc(100 * sizeof(int));
+  arr[0] = 42;
+  my_free(arr);
+  printf("Normal Allocation works good.\n\n");
 
-  int *arr1 = (int *)my_malloc(100 * sizeof(int));
-  int *arr2 = (int *)my_malloc(200 * sizeof(int));
+  printf("Testing Red Zones (Deliberate Buffer Overflow)...\n");
+  set_alloc_strategy(STRATEGY_FIRST_FIT);
 
-  int *arr3 = (int *)my_malloc(100 * sizeof(int));
+  char *str = (char *)my_malloc(10); // Requesting exactly 10 bytes
 
-  arr1[0] = 42;
-  arr2[0] = 84;
-  arr3[0] = 126;
-  printf("arr1[0] = %d, arr2[0] = %d, arr3[0] = %d\n", arr1[0], arr2[0], arr3[0]);
+  // We intentionally write 12 bytes here.
+  // It will overrun the 10-byte boundary and write into the BACK REDZONE
+  strcpy(str, "0123456789A");
 
-  my_free(arr1);
-  my_free(arr2);
-  my_free(arr3);
+  printf("Wrote 12 bytes into a 10-byte buffer...\n");
+  printf("Attempting to free buffer (should trigger redzone protection)...\n");
 
-  printf("Done!\n");
+  my_free(str); // Valgrind-like crash occurs here
+
+  printf("Done! (You won't see this if redzones are enabled)\n");
 
   return 0;
 }
