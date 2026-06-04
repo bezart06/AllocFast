@@ -5,8 +5,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 
 #define ENABLE_RED_ZONES 1
+#define ARENA_SIZE (64 * 1024)
 
 #if ENABLE_RED_ZONES
 #define REDZONE_SIZE 8
@@ -29,15 +31,39 @@ typedef struct BlockMeta {
 
 // Global state
 static BlockMeta *global_base = NULL;
+static BlockMeta *global_tail = NULL;
+static BlockMeta *global_free_list = NULL;
 static AllocStrategy current_strategy = STRATEGY_FIRST_FIT;
 
 // Segregated List (SLUB-like) Structure
-#define NUM_CLASSES 10
-static size_t class_sizes[NUM_CLASSES] = {8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
+#define NUM_CLASSES 11
+static size_t class_sizes[NUM_CLASSES] = {8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192};
 static BlockMeta *segregated_lists[NUM_CLASSES] = {NULL};
 
 // Mutex for thread-safety
 static pthread_mutex_t alloc_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void add_to_global_free_list(BlockMeta *block) {
+    block->next_free = global_free_list;
+    block->prev_free = NULL;
+    if (global_free_list) {
+        global_free_list->prev_free = block;
+    }
+    global_free_list = block;
+}
+
+static void remove_from_global_free_list(BlockMeta *block) {
+    if (block->prev_free) {
+        block->prev_free->next_free = block->next_free;
+    } else {
+        global_free_list = block->next_free;
+    }
+    if (block->next_free) {
+        block->next_free->prev_free = block->prev_free;
+    }
+    block->next_free = NULL;
+    block->prev_free = NULL;
+}
 
 static int get_class_index(size_t size) {
   for (int i = 0; i < NUM_CLASSES; i++) {
@@ -78,13 +104,17 @@ static void remove_from_segregated_list(BlockMeta *block) {
 }
 
 static BlockMeta *request_memory(BlockMeta *last, size_t size) {
-  void *request = mmap(NULL, size + META_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  size_t alloc_size = size + META_SIZE;
+  if (alloc_size < ARENA_SIZE) {
+      alloc_size = ARENA_SIZE;
+  }
 
+  void *request = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (request == MAP_FAILED) return NULL;
 
   BlockMeta *block = (BlockMeta *)request;
-  block->size = size;
-  block->is_free = false;
+  block->size = alloc_size - META_SIZE;
+  block->is_free = true;
   block->next = NULL;
   block->prev = last;
   block->next_free = NULL;
@@ -93,33 +123,39 @@ static BlockMeta *request_memory(BlockMeta *last, size_t size) {
   if (last) {
     last->next = block;
   }
+  if (!global_base) {
+      global_base = block;
+  }
+  global_tail = block;
+
+  if (!global_base) {
+    global_base = block;
+  }
+  global_tail = block;
+
   return block;
 }
 
-// First Fit
-static BlockMeta *find_first_fit(BlockMeta **last, size_t size) {
-  BlockMeta *current = global_base;
+static BlockMeta *find_first_fit(size_t size) {
+  BlockMeta *current = global_free_list;
   while (current) {
-    if (current->is_free && current->size >= size) return current;
-    *last = current;
-    current = current->next;
+    if (current->size >= size) return current;
+    current = current->next_free;
   }
   return NULL;
 }
 
-// Best Fit
-static BlockMeta *find_best_fit(BlockMeta **last, size_t size) {
-  BlockMeta *current = global_base;
+static BlockMeta *find_best_fit(size_t size) {
+  BlockMeta *current = global_free_list;
   BlockMeta *best_fit = NULL;
 
   while (current) {
-    if (current->is_free && current->size >= size) {
+    if (current->size >= size) {
       if (!best_fit || current->size < best_fit->size) {
         best_fit = current;
       }
     }
-    *last = current;
-    current = current->next;
+    current = current->next_free;
   }
   return best_fit;
 }
@@ -149,10 +185,7 @@ static BlockMeta *find_segregated_fit(BlockMeta **last, size_t size) {
   void *slab = mmap(NULL, num_chunks * block_total_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (slab == MAP_FAILED) return NULL;
 
-  BlockMeta *tail = global_base;
-  if (tail) {
-      while (tail->next) tail = tail->next;
-  }
+  BlockMeta *tail = global_tail;
 
   for (int i = 0; i < num_chunks; i++) {
     BlockMeta *block = (BlockMeta *)((char *)slab + i * block_total_size);
@@ -169,6 +202,7 @@ static BlockMeta *find_segregated_fit(BlockMeta **last, size_t size) {
       global_base = block;
     }
     tail = block;
+    global_tail = block;
 
     add_to_segregated_list(block);
   }
@@ -180,7 +214,7 @@ static BlockMeta *find_segregated_fit(BlockMeta **last, size_t size) {
   return result;
 }
 
-static void split_block(BlockMeta *block, size_t size) {
+static BlockMeta *split_block(BlockMeta *block, size_t size) {
   if (block->size >= size + META_SIZE + 8) {
     BlockMeta *new_block = (BlockMeta *)((char *)block + META_SIZE + size);
 
@@ -194,17 +228,27 @@ static void split_block(BlockMeta *block, size_t size) {
 
     if (new_block->next) {
       new_block->next->prev = new_block;
+    } else {
+        global_tail = new_block;
     }
     block->next = new_block;
-
     block->size = size;
+
+    return new_block;
   }
+  return NULL;
 }
 
 static BlockMeta *coalesce_blocks(BlockMeta *block) {
   if (block->next && block->next->is_free) {
     if ((char *)block + META_SIZE + block->size == (char *)block->next) {
+      remove_from_global_free_list(block->next);
       block->size += META_SIZE + block->next->size;
+
+      if (block->next == global_tail) {
+          global_tail = block;
+      }
+
       block->next = block->next->next;
       if (block->next) {
         block->next->prev = block;
@@ -214,7 +258,13 @@ static BlockMeta *coalesce_blocks(BlockMeta *block) {
 
   if (block->prev && block->prev->is_free) {
     if ((char *)block->prev + META_SIZE + block->prev->size == (char *)block) {
+      remove_from_global_free_list(block->prev);
       block->prev->size += META_SIZE + block->size;
+
+      if (block == global_tail) {
+          global_tail = block->prev;
+      }
+
       block->prev->next = block->next;
       if (block->next) {
         block->next->prev = block->prev;
@@ -228,7 +278,6 @@ static BlockMeta *coalesce_blocks(BlockMeta *block) {
 
 void *my_malloc(size_t size) {
   if (size == 0) return NULL;
-
   pthread_mutex_lock(&alloc_mutex);
 
   size_t exact_req_size = size;
@@ -237,7 +286,6 @@ void *my_malloc(size_t size) {
 #if ENABLE_RED_ZONES
   alloc_size += 2 * REDZONE_SIZE;
 #endif
-
   alloc_size = (alloc_size + 7) & ~7;
 
   BlockMeta *block = NULL;
@@ -245,44 +293,32 @@ void *my_malloc(size_t size) {
 
   if (current_strategy == STRATEGY_SEGREGATED) {
     block = find_segregated_fit(&last, alloc_size);
-  } else {
-    if (!global_base) {
-      block = request_memory(NULL, alloc_size);
-      if (!block) {
-        pthread_mutex_unlock(&alloc_mutex);
-        return NULL;
-      }
-      global_base = block;
-      goto format_block;
-    }
-
-    last = global_base;
-    if (current_strategy == STRATEGY_FIRST_FIT) {
-      block = find_first_fit(&last, alloc_size);
-    } else if (current_strategy == STRATEGY_BEST_FIT) {
-      block = find_best_fit(&last, alloc_size);
-    }
-  }
-
-  if (!block) {
-    if (global_base && !last) {
-      last = global_base;
-      while (last->next) last = last->next;
-    }
-    block = request_memory(last, alloc_size);
     if (!block) {
-      pthread_mutex_unlock(&alloc_mutex);
-      return NULL;
+        block = request_memory(global_tail, alloc_size);
+        if (!block) goto fail;
     }
-    if (!global_base) global_base = block;
+    block->is_free = false;
   } else {
-    if (current_strategy != STRATEGY_SEGREGATED) {
-      split_block(block, alloc_size);
+    if (current_strategy == STRATEGY_FIRST_FIT) {
+      block = find_first_fit(alloc_size);
+    } else if (current_strategy == STRATEGY_BEST_FIT) {
+      block = find_best_fit(alloc_size);
+    }
+
+    if (!block) {
+      block = request_memory(global_tail, alloc_size);
+      if (!block) goto fail;
+    } else {
+      remove_from_global_free_list(block);
+    }
+
+    BlockMeta *remainder = split_block(block, alloc_size);
+    if (remainder) {
+        add_to_global_free_list(remainder);
     }
     block->is_free = false;
   }
 
-format_block:
 #if ENABLE_RED_ZONES
   block->exact_size = exact_req_size;
   char *front_rz = (char *)(block + 1);
@@ -298,6 +334,10 @@ format_block:
   pthread_mutex_unlock(&alloc_mutex);
   return (block + 1);
 #endif
+
+fail:
+  pthread_mutex_unlock(&alloc_mutex);
+  return NULL;
 }
 
 static BlockMeta *get_block_ptr(void *ptr) {
@@ -310,7 +350,6 @@ static BlockMeta *get_block_ptr(void *ptr) {
 
 void my_free(void *ptr) {
   if (!ptr) return;
-
   pthread_mutex_lock(&alloc_mutex);
 
   BlockMeta *block = get_block_ptr(ptr);
@@ -323,12 +362,12 @@ void my_free(void *ptr) {
   bool corrupted = false;
   for (int i = 0; i < REDZONE_SIZE; i++) {
     if ((unsigned char)front_rz[i] != REDZONE_MAGIC) {
-      fprintf(stderr, "\n[FATAL ERROR] Underflow detected (Front redzone corrupted) at block %p!\n", ptr);
+      fprintf(stderr, "\n[FATAL ERROR] Underflow detected at block %p!\n", ptr);
       corrupted = true;
       break;
     }
     if ((unsigned char)back_rz[i] != REDZONE_MAGIC) {
-      fprintf(stderr, "\n[FATAL ERROR] Overflow detected (Back redzone corrupted) at block %p!\n", ptr);
+      fprintf(stderr, "\n[FATAL ERROR] Overflow detected at block %p!\n", ptr);
       corrupted = true;
       break;
     }
@@ -344,9 +383,15 @@ void my_free(void *ptr) {
   block->is_free = true;
 
   if (current_strategy == STRATEGY_SEGREGATED) {
-      add_to_segregated_list(block);
+      int idx = get_class_index(block->size);
+      if (idx != -1) {
+          add_to_segregated_list(block);
+      } else {
+          coalesce_blocks(block);
+      }
   } else {
-      coalesce_blocks(block);
+      block = coalesce_blocks(block);
+      add_to_global_free_list(block);
   }
 
   pthread_mutex_unlock(&alloc_mutex);
@@ -358,14 +403,85 @@ void set_alloc_strategy(AllocStrategy strategy) {
     pthread_mutex_unlock(&alloc_mutex);
 }
 
+// MICRO-BENCHMARK SUITE
+#define BENCHMARK_ALLOCS 50000
+#define MAX_ALLOC_SIZE 4096
+
+static double get_time_diff(struct timespec start, struct timespec end) {
+    return (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+}
+
+static void run_benchmarks(void) {
+    void *ptrs[BENCHMARK_ALLOCS];
+    size_t sizes[BENCHMARK_ALLOCS];
+    struct timespec start, end;
+
+    srand(42);
+    for (int i = 0; i < BENCHMARK_ALLOCS; i++) {
+        sizes[i] = (rand() % MAX_ALLOC_SIZE) + 1;
+    }
+
+    printf("Benchmarking %d allocations & frees (Max size: %d bytes)...\n\n", BENCHMARK_ALLOCS, MAX_ALLOC_SIZE);
+
+    // glibc malloc/free
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int i = 0; i < BENCHMARK_ALLOCS; i++) {
+        ptrs[i] = malloc(sizes[i]);
+    }
+    for (int i = 0; i < BENCHMARK_ALLOCS; i++) {
+        free(ptrs[i]);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    printf("[1] glibc malloc/free:      %f seconds\n", get_time_diff(start, end));
+
+    // AllocFast - First Fit
+    set_alloc_strategy(STRATEGY_FIRST_FIT);
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int i = 0; i < BENCHMARK_ALLOCS; i++) {
+        ptrs[i] = my_malloc(sizes[i]);
+    }
+    for (int i = 0; i < BENCHMARK_ALLOCS; i++) {
+        my_free(ptrs[i]);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    printf("[2] AllocFast (First Fit):  %f seconds\n", get_time_diff(start, end));
+
+    // AllocFast - Best Fit
+    set_alloc_strategy(STRATEGY_BEST_FIT);
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int i = 0; i < BENCHMARK_ALLOCS; i++) {
+        ptrs[i] = my_malloc(sizes[i]);
+    }
+    for (int i = 0; i < BENCHMARK_ALLOCS; i++) {
+        my_free(ptrs[i]);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    printf("[3] AllocFast (Best Fit):   %f seconds\n", get_time_diff(start, end));
+
+    // AllocFast - Segregated
+    set_alloc_strategy(STRATEGY_SEGREGATED);
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int i = 0; i < BENCHMARK_ALLOCS; i++) {
+        ptrs[i] = my_malloc(sizes[i]);
+    }
+    for (int i = 0; i < BENCHMARK_ALLOCS; i++) {
+        my_free(ptrs[i]);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    printf("[4] AllocFast (Segregated): %f seconds\n\n", get_time_diff(start, end));
+}
+
 int main(void) {
-  printf("Testing Normal Allocation...\n");
+  printf("AllocFast Micro-Benchmarks:\n");
+  run_benchmarks();
+
+  printf("Testing Normal Allocation:\n");
   int *arr = (int *)my_malloc(100 * sizeof(int));
   arr[0] = 42;
   my_free(arr);
   printf("Normal Allocation works good.\n\n");
 
-  printf("Testing Red Zones (Deliberate Buffer Overflow)...\n");
+  printf("Testing Red Zones (Deliberate Buffer Overflow):\n");
   set_alloc_strategy(STRATEGY_FIRST_FIT);
 
   char *str = (char *)my_malloc(10); // Requesting exactly 10 bytes
