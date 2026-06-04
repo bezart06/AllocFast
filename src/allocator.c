@@ -4,6 +4,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #define ENABLE_RED_ZONES 1
 
@@ -26,7 +27,7 @@ typedef struct BlockMeta {
 
 #define META_SIZE sizeof(BlockMeta)
 
-// Global state (in a real project, a mutex is required for thread-safety)
+// Global state
 static BlockMeta *global_base = NULL;
 static AllocStrategy current_strategy = STRATEGY_FIRST_FIT;
 
@@ -34,6 +35,9 @@ static AllocStrategy current_strategy = STRATEGY_FIRST_FIT;
 #define NUM_CLASSES 10
 static size_t class_sizes[NUM_CLASSES] = {8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
 static BlockMeta *segregated_lists[NUM_CLASSES] = {NULL};
+
+// Mutex for thread-safety
+static pthread_mutex_t alloc_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int get_class_index(size_t size) {
   for (int i = 0; i < NUM_CLASSES; i++) {
@@ -225,6 +229,8 @@ static BlockMeta *coalesce_blocks(BlockMeta *block) {
 void *my_malloc(size_t size) {
   if (size == 0) return NULL;
 
+  pthread_mutex_lock(&alloc_mutex);
+
   size_t exact_req_size = size;
   size_t alloc_size = size;
 
@@ -242,7 +248,10 @@ void *my_malloc(size_t size) {
   } else {
     if (!global_base) {
       block = request_memory(NULL, alloc_size);
-      if (!block) return NULL;
+      if (!block) {
+        pthread_mutex_unlock(&alloc_mutex);
+        return NULL;
+      }
       global_base = block;
       goto format_block;
     }
@@ -261,7 +270,10 @@ void *my_malloc(size_t size) {
       while (last->next) last = last->next;
     }
     block = request_memory(last, alloc_size);
-    if (!block) return NULL;
+    if (!block) {
+      pthread_mutex_unlock(&alloc_mutex);
+      return NULL;
+    }
     if (!global_base) global_base = block;
   } else {
     if (current_strategy != STRATEGY_SEGREGATED) {
@@ -280,8 +292,10 @@ format_block:
   memset(front_rz, REDZONE_MAGIC, REDZONE_SIZE);
   memset(back_rz, REDZONE_MAGIC, REDZONE_SIZE);
 
+  pthread_mutex_unlock(&alloc_mutex);
   return payload;
 #else
+  pthread_mutex_unlock(&alloc_mutex);
   return (block + 1);
 #endif
 }
@@ -296,6 +310,8 @@ static BlockMeta *get_block_ptr(void *ptr) {
 
 void my_free(void *ptr) {
   if (!ptr) return;
+
+  pthread_mutex_lock(&alloc_mutex);
 
   BlockMeta *block = get_block_ptr(ptr);
 
@@ -320,6 +336,7 @@ void my_free(void *ptr) {
 
   if (corrupted) {
     fprintf(stderr, "Aborting execution.\n");
+    pthread_mutex_unlock(&alloc_mutex);
     abort();
   }
 #endif
@@ -331,9 +348,15 @@ void my_free(void *ptr) {
   } else {
       coalesce_blocks(block);
   }
+
+  pthread_mutex_unlock(&alloc_mutex);
 }
 
-void set_alloc_strategy(AllocStrategy strategy) { current_strategy = strategy; }
+void set_alloc_strategy(AllocStrategy strategy) {
+    pthread_mutex_lock(&alloc_mutex);
+    current_strategy = strategy;
+    pthread_mutex_unlock(&alloc_mutex);
+}
 
 int main(void) {
   printf("Testing Normal Allocation...\n");

@@ -5,3 +5,4 @@ CompileFlags:
         - "-Wall"
         - "-Wextra"
         - "-std=c11"
+        - "-pthread"
