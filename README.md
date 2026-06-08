@@ -18,6 +18,89 @@ I built this project to deepen my understanding of systems programming, operatin
 * Concurrency controls and race conditions in low-level memory handling.
 * Debugging tools and security mechanisms like Valgrind-style red zones.
 
+## Architecture
+
+AllocFast bypasses the standard library and uses `mmap` to request memory directly from the kernel. It supports multiple allocation strategies and uses red zones to detect memory corruption.
+
+### 1. Control Flow
+
+This diagram illustrates how allocations are routed through the custom thread-safe allocator:
+
+```mermaid
+flowchart TD
+    App([User Application]) --> |my_malloc / my_free| API[Public API]
+
+    subgraph AllocFast Memory Allocator
+        API --> Mutex{pthread_mutex}
+        Mutex --> |Lock| Core[Core Allocation Logic]
+
+        Core --> |Strategy Check| Router{AllocStrategy}
+        Router --> |STRATEGY_FIRST_FIT| FF[First-Fit Search]
+        Router --> |STRATEGY_BEST_FIT| BF[Best-Fit Search]
+        Router --> |STRATEGY_SEGREGATED| SL[Segregated List Search]
+
+        FF --> GlobalFree[(Global Free List)]
+        BF --> GlobalFree
+        SL --> SegLists[(Segregated Lists Array)]
+
+        GlobalFree --> Miss[Cache Miss / No Block Found]
+        SegLists --> Miss
+
+        GlobalFree --> Hit[Block Found]
+        SegLists --> Hit
+
+        Miss --> SysCall[request_memory]
+        
+        Hit --> Split[Split Block & Update Lists]
+        SysCall --> Security[Apply Security Measures]
+        Split --> Security
+
+        Security --> |Write 0xAA Red Zones| MutexUnlock{pthread_mutex_unlock}
+    end
+
+    SysCall --> |mmap anonymous pages| OS[(UNIX Kernel)]
+    MutexUnlock --> Return([Return Payload Pointer])
+    
+    classDef memory fill:#f9f,stroke:#333,stroke-width:2px;
+    class OS,GlobalFree,SegLists memory;
+```
+
+### 2. Memory Layout (Red Zones)
+
+This diagram shows the physical layout of a single allocated memory chunk, including the metadata node and the `0xAA` security boundaries (Red Zones) used to catch buffer overflows.
+
+```mermaid
+classDiagram
+    class GlobalHeap {
+        +BlockMeta* global_base
+        +BlockMeta* global_tail
+        +BlockMeta* global_free_list
+        +BlockMeta*[11] segregated_lists
+    }
+
+    class BlockMeta {
+        <<Header / Metadata>>
+        +size_t size
+        +size_t exact_size
+        +bool is_free
+        +BlockMeta* next
+        +BlockMeta* prev
+        +BlockMeta* next_free
+        +BlockMeta* prev_free
+    }
+
+    class MemoryChunk {
+        <<Physical Memory Layout>>
+        +BlockMeta metadata
+        +char[8] front_redzone (0xAA)
+        +void* payload
+        +char[8] back_redzone (0xAA)
+    }
+
+    GlobalHeap "1" *-- "many" BlockMeta : tracks
+    BlockMeta "1" -- "1" MemoryChunk : resides directly before
+```
+
 ## How to Build
 
 The project is written in standard C11 and requires a POSIX-compliant environment (Linux/macOS) due to the use of `mmap` and `pthread`. 
