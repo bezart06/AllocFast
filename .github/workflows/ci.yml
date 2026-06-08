@@ -1,0 +1,39 @@
+name: CI Build and Test
+
+on:
+    push:
+        branches: ["main", "master"]
+    pull_request:
+        branches: ["main", "master"]
+
+jobs:
+    build-and-test:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Create build directory
+              run: mkdir -p build
+
+            - name: Compile AllocFast
+              run: gcc -std=c11 -Wall -Wextra -Iinclude -pthread src/allocator.c -o build/allocfast
+
+            - name: Run Benchmarks and Tests (with Negative Testing)
+              run: |
+                  set +e
+
+                  OUTPUT=$(./build/allocfast 2>&1)
+
+                  set -e
+
+                  echo "$OUTPUT"
+
+                  if echo "$OUTPUT" | grep -q "\[FATAL ERROR\] Overflow detected"; then
+                    echo "SUCCESS: Red Zone protection successfully triggered!"
+                    exit 0
+                  else
+                    echo "FAILURE: Expected Red Zone crash did not occur, or the program failed during benchmarks."
+                    exit 1
+                  fi
