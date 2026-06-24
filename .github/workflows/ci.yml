@@ -18,7 +18,7 @@ jobs:
               run: mkdir -p build
 
             - name: Compile AllocFast
-              run: gcc -std=c11 -Wall -Wextra -Iinclude -pthread src/allocator.c -o build/allocfast
+              run: gcc -std=c11 -Wall -Wextra -O3 -flto -s -Iinclude -pthread src/allocator.c -o build/allocfast
 
             - name: Run Benchmarks and Tests (with Negative Testing)
               run: |

@@ -105,11 +105,18 @@ classDiagram
 
 The project is written in standard C11 and requires a POSIX-compliant environment (Linux/macOS) due to the use of `mmap` and `pthread`. 
 
-To compile the project, run the following commands from the root directory:
+To compile the project with standard settings (recommended for debugging and development), run from the root directory:
 
 ```bash
 mkdir -p build
 gcc -std=c11 -Wall -Wextra -Iinclude -pthread src/allocator.c -o build/allocfast
+```
+
+For an optimized release build (which enables Link Time Optimization and strips debug symbols for maximum benchmark performance), run:
+
+```bash
+mkdir -p build
+gcc -std=c11 -Wall -Wextra -O3 -flto -s -Iinclude -pthread src/allocator.c -o build/allocfast
 ```
 
 ## How to Run
