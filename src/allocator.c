@@ -9,6 +9,7 @@
 
 #define ENABLE_RED_ZONES 1
 #define ARENA_SIZE (64 * 1024)
+#define ALIGN_MASK (~7UL)
 
 #if ENABLE_RED_ZONES
 #define REDZONE_SIZE 8
@@ -16,11 +17,10 @@
 #endif
 
 typedef struct BlockMeta {
-  size_t size;
+  size_t size_and_flags;
 #if ENABLE_RED_ZONES
   size_t exact_size;
 #endif
-  bool is_free;
   struct BlockMeta *next;
   struct BlockMeta *prev;
   struct BlockMeta *next_free;
@@ -42,6 +42,27 @@ static BlockMeta *segregated_lists[NUM_CLASSES] = {NULL};
 
 // Mutex for thread-safety
 static pthread_mutex_t alloc_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Bitwise helpers for size_and_flags packing
+static inline size_t get_size(BlockMeta *block) {
+    return block->size_and_flags & ALIGN_MASK;
+}
+
+static inline void set_size(BlockMeta *block, size_t size) {
+    block->size_and_flags = size | (block->size_and_flags & 1UL);
+}
+
+static inline bool get_is_free(BlockMeta *block) {
+    return (block->size_and_flags & 1UL) != 0;
+}
+
+static inline void set_is_free(BlockMeta *block, bool is_free) {
+    if (is_free) {
+        block->size_and_flags |= 1UL;
+    } else {
+        block->size_and_flags &= ~1UL;
+    }
+}
 
 static void add_to_global_free_list(BlockMeta *block) {
     block->next_free = global_free_list;
@@ -73,7 +94,7 @@ static int get_class_index(size_t size) {
 }
 
 static void add_to_segregated_list(BlockMeta *block) {
-  int idx = get_class_index(block->size);
+  int idx = get_class_index(get_size(block));
   if (idx == -1) return;
 
   block->next_free = segregated_lists[idx];
@@ -86,7 +107,7 @@ static void add_to_segregated_list(BlockMeta *block) {
 }
 
 static void remove_from_segregated_list(BlockMeta *block) {
-  int idx = get_class_index(block->size);
+  int idx = get_class_index(get_size(block));
   if (idx == -1) return;
 
   if (block->prev_free) {
@@ -113,8 +134,9 @@ static BlockMeta *request_memory(BlockMeta *last, size_t size) {
   if (request == MAP_FAILED) return NULL;
 
   BlockMeta *block = (BlockMeta *)request;
-  block->size = alloc_size - META_SIZE;
-  block->is_free = true;
+  block->size_and_flags = 0;
+  set_size(block, alloc_size - META_SIZE);
+  set_is_free(block, true);
   block->next = NULL;
   block->prev = last;
   block->next_free = NULL;
@@ -128,18 +150,13 @@ static BlockMeta *request_memory(BlockMeta *last, size_t size) {
   }
   global_tail = block;
 
-  if (!global_base) {
-    global_base = block;
-  }
-  global_tail = block;
-
   return block;
 }
 
 static BlockMeta *find_first_fit(size_t size) {
   BlockMeta *current = global_free_list;
   while (current) {
-    if (current->size >= size) return current;
+    if (get_size(current) >= size) return current;
     current = current->next_free;
   }
   return NULL;
@@ -150,8 +167,8 @@ static BlockMeta *find_best_fit(size_t size) {
   BlockMeta *best_fit = NULL;
 
   while (current) {
-    if (current->size >= size) {
-      if (!best_fit || current->size < best_fit->size) {
+    if (get_size(current) >= size) {
+      if (!best_fit || get_size(current) < get_size(best_fit)) {
         best_fit = current;
       }
     }
@@ -189,8 +206,9 @@ static BlockMeta *find_segregated_fit(BlockMeta **last, size_t size) {
 
   for (int i = 0; i < num_chunks; i++) {
     BlockMeta *block = (BlockMeta *)((char *)slab + i * block_total_size);
-    block->size = chunk_size;
-    block->is_free = true;
+    block->size_and_flags = 0;
+    set_size(block, chunk_size);
+    set_is_free(block, true);
     block->next_free = NULL;
     block->prev_free = NULL;
 
@@ -215,11 +233,12 @@ static BlockMeta *find_segregated_fit(BlockMeta **last, size_t size) {
 }
 
 static BlockMeta *split_block(BlockMeta *block, size_t size) {
-  if (block->size >= size + META_SIZE + 8) {
+  if (get_size(block) >= size + META_SIZE + 8) {
     BlockMeta *new_block = (BlockMeta *)((char *)block + META_SIZE + size);
 
-    new_block->size = block->size - size - META_SIZE;
-    new_block->is_free = true;
+    new_block->size_and_flags = 0;
+    set_size(new_block, get_size(block) - size - META_SIZE);
+    set_is_free(new_block, true);
     new_block->next_free = NULL;
     new_block->prev_free = NULL;
 
@@ -232,7 +251,7 @@ static BlockMeta *split_block(BlockMeta *block, size_t size) {
         global_tail = new_block;
     }
     block->next = new_block;
-    block->size = size;
+    set_size(block, size);
 
     return new_block;
   }
@@ -240,10 +259,10 @@ static BlockMeta *split_block(BlockMeta *block, size_t size) {
 }
 
 static BlockMeta *coalesce_blocks(BlockMeta *block) {
-  if (block->next && block->next->is_free) {
-    if ((char *)block + META_SIZE + block->size == (char *)block->next) {
+  if (block->next && get_is_free(block->next)) {
+    if ((char *)block + META_SIZE + get_size(block) == (char *)block->next) {
       remove_from_global_free_list(block->next);
-      block->size += META_SIZE + block->next->size;
+      set_size(block, get_size(block) + META_SIZE + get_size(block->next));
 
       if (block->next == global_tail) {
           global_tail = block;
@@ -256,10 +275,10 @@ static BlockMeta *coalesce_blocks(BlockMeta *block) {
     }
   }
 
-  if (block->prev && block->prev->is_free) {
-    if ((char *)block->prev + META_SIZE + block->prev->size == (char *)block) {
+  if (block->prev && get_is_free(block->prev)) {
+    if ((char *)block->prev + META_SIZE + get_size(block->prev) == (char *)block) {
       remove_from_global_free_list(block->prev);
-      block->prev->size += META_SIZE + block->size;
+      set_size(block->prev, get_size(block->prev) + META_SIZE + get_size(block));
 
       if (block == global_tail) {
           global_tail = block->prev;
@@ -297,7 +316,7 @@ void *my_malloc(size_t size) {
         block = request_memory(global_tail, alloc_size);
         if (!block) goto fail;
     }
-    block->is_free = false;
+    set_is_free(block, false);
   } else {
     if (current_strategy == STRATEGY_FIRST_FIT) {
       block = find_first_fit(alloc_size);
@@ -316,7 +335,7 @@ void *my_malloc(size_t size) {
     if (remainder) {
         add_to_global_free_list(remainder);
     }
-    block->is_free = false;
+    set_is_free(block, false);
   }
 
 #if ENABLE_RED_ZONES
@@ -380,10 +399,10 @@ void my_free(void *ptr) {
   }
 #endif
 
-  block->is_free = true;
+  set_is_free(block, true);
 
   if (current_strategy == STRATEGY_SEGREGATED) {
-      int idx = get_class_index(block->size);
+      int idx = get_class_index(get_size(block));
       if (idx != -1) {
           add_to_segregated_list(block);
       } else {
