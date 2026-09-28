@@ -109,14 +109,14 @@ To compile the project with standard settings (recommended for debugging and dev
 
 ```bash
 mkdir -p build
-gcc -std=c11 -Wall -Wextra -Iinclude -pthread src/allocator.c -o build/allocfast
+gcc -std=c11 -Wall -Wextra -Iinclude -pthread src/allocator.c src/test.c -o build/allocfast
 ```
 
 For an optimized release build (which enables Link Time Optimization and strips debug symbols for maximum benchmark performance), run:
 
 ```bash
 mkdir -p build
-gcc -std=c11 -Wall -Wextra -O3 -flto -s -Iinclude -pthread src/allocator.c -o build/allocfast
+gcc -std=c11 -Wall -Wextra -O3 -flto -s -Iinclude -pthread src/allocator.c src/test.c -o build/allocfast
 ```
 
 ## How to Run
