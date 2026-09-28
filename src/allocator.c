@@ -23,11 +23,18 @@ typedef struct BlockMeta {
 #endif
   struct BlockMeta *next;
   struct BlockMeta *prev;
-  struct BlockMeta *next_free;
-  struct BlockMeta *prev_free;
+
+  // These are only valid when is_free == true.
+  union {
+    struct {
+      struct BlockMeta *next_free;
+      struct BlockMeta *prev_free;
+    };
+  };
 } BlockMeta;
 
-#define META_SIZE sizeof(BlockMeta)
+#define META_SIZE offsetof(BlockMeta, next_free)
+#define MIN_PAYLOAD_SIZE (sizeof(struct BlockMeta *) * 2)
 
 // Global state
 static BlockMeta *global_base = NULL;
@@ -189,6 +196,9 @@ static BlockMeta *find_segregated_fit(BlockMeta **last, size_t size) {
   }
 
   size_t chunk_size = class_sizes[idx];
+  if (chunk_size < MIN_PAYLOAD_SIZE) {
+      chunk_size = MIN_PAYLOAD_SIZE;
+  }
   size_t block_total_size = chunk_size + META_SIZE;
   size_t page_size = sysconf(_SC_PAGESIZE);
 
@@ -233,7 +243,7 @@ static BlockMeta *find_segregated_fit(BlockMeta **last, size_t size) {
 }
 
 static BlockMeta *split_block(BlockMeta *block, size_t size) {
-  if (get_size(block) >= size + META_SIZE + 8) {
+  if (get_size(block) >= size + META_SIZE + MIN_PAYLOAD_SIZE) {
     BlockMeta *new_block = (BlockMeta *)((char *)block + META_SIZE + size);
 
     new_block->size_and_flags = 0;
@@ -305,7 +315,11 @@ void *my_malloc(size_t size) {
 #if ENABLE_RED_ZONES
   alloc_size += 2 * REDZONE_SIZE;
 #endif
+
   alloc_size = (alloc_size + 7) & ~7;
+  if (alloc_size < MIN_PAYLOAD_SIZE) {
+      alloc_size = MIN_PAYLOAD_SIZE;
+  }
 
   BlockMeta *block = NULL;
   BlockMeta *last = NULL;
@@ -340,7 +354,7 @@ void *my_malloc(size_t size) {
 
 #if ENABLE_RED_ZONES
   block->exact_size = exact_req_size;
-  char *front_rz = (char *)(block + 1);
+  char *front_rz = (char *)block + META_SIZE;
   char *payload = front_rz + REDZONE_SIZE;
   char *back_rz = payload + exact_req_size;
 
@@ -351,7 +365,7 @@ void *my_malloc(size_t size) {
   return payload;
 #else
   pthread_mutex_unlock(&alloc_mutex);
-  return (block + 1);
+  return (void *)((char *)block + META_SIZE);
 #endif
 
 fail:
@@ -361,9 +375,9 @@ fail:
 
 static BlockMeta *get_block_ptr(void *ptr) {
 #if ENABLE_RED_ZONES
-  return (BlockMeta *)((char *)ptr - REDZONE_SIZE) - 1;
+  return (BlockMeta *)((char *)ptr - REDZONE_SIZE - META_SIZE);
 #else
-  return (BlockMeta *)ptr - 1;
+  return (BlockMeta *)((char *)ptr - META_SIZE);
 #endif
 }
 
@@ -375,7 +389,7 @@ void my_free(void *ptr) {
 
 #if ENABLE_RED_ZONES
   char *payload = (char *)ptr;
-  char *front_rz = (char *)(block + 1);
+  char *front_rz = (char *)block + META_SIZE;
   char *back_rz = payload + block->exact_size;
 
   bool corrupted = false;
