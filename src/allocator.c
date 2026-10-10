@@ -7,7 +7,10 @@
 #include <pthread.h>
 #include <time.h>
 
-#define ENABLE_RED_ZONES 1
+#ifndef ENABLE_RED_ZONES
+#define ENABLE_RED_ZONES 0
+#endif
+
 #define ARENA_SIZE (64 * 1024)
 #define ALIGN_MASK (~7UL)
 
@@ -309,7 +312,9 @@ void *my_malloc(size_t size) {
   if (size == 0) return NULL;
   pthread_mutex_lock(&alloc_mutex);
 
+#if ENABLE_RED_ZONES
   size_t exact_req_size = size;
+#endif
   size_t alloc_size = size;
 
 #if ENABLE_RED_ZONES

@@ -6,3 +6,4 @@ CompileFlags:
         - "-Wextra"
         - "-std=c11"
         - "-pthread"
+        - "-DENABLE_RED_ZONES=1"
