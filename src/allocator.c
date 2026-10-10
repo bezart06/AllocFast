@@ -96,14 +96,16 @@ static void remove_from_global_free_list(BlockMeta *block) {
     block->prev_free = NULL;
 }
 
-static int get_class_index(size_t size) {
-  for (int i = 0; i < NUM_CLASSES; i++) {
-    if (size <= class_sizes[i]) return i;
-  }
-  return -1;
+static inline __attribute__((always_inline)) int get_class_index(size_t size) {
+    if (size <= 8) return 0;
+
+    int idx = 64 - __builtin_clzll(size - 1) - 3;
+
+    if (idx >= NUM_CLASSES) return -1;
+    return idx;
 }
 
-static void add_to_segregated_list(BlockMeta *block) {
+static inline void add_to_segregated_list(BlockMeta *block) {
   int idx = get_class_index(get_size(block));
   if (idx == -1) return;
 
@@ -116,7 +118,7 @@ static void add_to_segregated_list(BlockMeta *block) {
   segregated_lists[idx] = block;
 }
 
-static void remove_from_segregated_list(BlockMeta *block) {
+static inline __attribute__((always_inline)) void remove_from_segregated_list(BlockMeta *block) {
   int idx = get_class_index(get_size(block));
   if (idx == -1) return;
 
@@ -155,6 +157,7 @@ static BlockMeta *request_memory(BlockMeta *last, size_t size) {
   if (last) {
     last->next = block;
   }
+
   if (!global_base) {
       global_base = block;
   }
@@ -187,21 +190,12 @@ static BlockMeta *find_best_fit(size_t size) {
   return best_fit;
 }
 
-// Segregated Fit
-static BlockMeta *find_segregated_fit(BlockMeta **last, size_t size) {
-  int idx = get_class_index(size);
-  if (idx == -1) return NULL;
-
-  if (segregated_lists[idx]) {
-    BlockMeta *block = segregated_lists[idx];
-    remove_from_segregated_list(block);
-    return block;
-  }
-
+static __attribute__((noinline)) BlockMeta *allocate_slab_slow_path(BlockMeta **last, int idx) {
   size_t chunk_size = class_sizes[idx];
   if (chunk_size < MIN_PAYLOAD_SIZE) {
       chunk_size = MIN_PAYLOAD_SIZE;
   }
+
   size_t block_total_size = chunk_size + META_SIZE;
   size_t page_size = sysconf(_SC_PAGESIZE);
 
@@ -222,11 +216,13 @@ static BlockMeta *find_segregated_fit(BlockMeta **last, size_t size) {
     block->size_and_flags = 0;
     set_size(block, chunk_size);
     set_is_free(block, true);
+
     block->next_free = NULL;
     block->prev_free = NULL;
 
     block->prev = tail;
     block->next = NULL;
+
     if (tail) {
       tail->next = block;
     } else {
@@ -245,6 +241,19 @@ static BlockMeta *find_segregated_fit(BlockMeta **last, size_t size) {
   return result;
 }
 
+static inline __attribute__((always_inline)) BlockMeta *find_segregated_fit(BlockMeta **last, size_t size) {
+  int idx = get_class_index(size);
+  if (idx == -1) return NULL;
+
+  if (segregated_lists[idx]) {
+    BlockMeta *block = segregated_lists[idx];
+    remove_from_segregated_list(block);
+    return block;
+  }
+
+  return allocate_slab_slow_path(last, idx);
+}
+
 static BlockMeta *split_block(BlockMeta *block, size_t size) {
   if (get_size(block) >= size + META_SIZE + MIN_PAYLOAD_SIZE) {
     BlockMeta *new_block = (BlockMeta *)((char *)block + META_SIZE + size);
@@ -252,6 +261,7 @@ static BlockMeta *split_block(BlockMeta *block, size_t size) {
     new_block->size_and_flags = 0;
     set_size(new_block, get_size(block) - size - META_SIZE);
     set_is_free(new_block, true);
+
     new_block->next_free = NULL;
     new_block->prev_free = NULL;
 
@@ -304,19 +314,19 @@ static BlockMeta *coalesce_blocks(BlockMeta *block) {
       block = block->prev;
     }
   }
-
   return block;
 }
 
 void *my_malloc(size_t size) {
   if (size == 0) return NULL;
+
   pthread_mutex_lock(&alloc_mutex);
 
 #if ENABLE_RED_ZONES
   size_t exact_req_size = size;
 #endif
-  size_t alloc_size = size;
 
+  size_t alloc_size = size;
 #if ENABLE_RED_ZONES
   alloc_size += 2 * REDZONE_SIZE;
 #endif
@@ -388,6 +398,7 @@ static BlockMeta *get_block_ptr(void *ptr) {
 
 void my_free(void *ptr) {
   if (!ptr) return;
+
   pthread_mutex_lock(&alloc_mutex);
 
   BlockMeta *block = get_block_ptr(ptr);

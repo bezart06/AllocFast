@@ -62,10 +62,8 @@ static void run_benchmarks(void) {
     set_alloc_strategy(STRATEGY_SEGREGATED);
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int i = 0; i < BENCHMARK_ALLOCS; i++) {
-        ptrs[i] = my_malloc(sizes[i]);
-    }
-    for (int i = 0; i < BENCHMARK_ALLOCS; i++) {
-        my_free(ptrs[i]);
+        void *ptr = my_malloc(sizes[i]);
+        my_free(ptr);
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
     printf("[4] AllocFast (Segregated): %f seconds\n\n", get_time_diff(start, end));
